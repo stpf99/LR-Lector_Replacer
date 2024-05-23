@@ -59,7 +59,7 @@ class AudioSubGenerator(Gtk.Window):
         model_path_label = Gtk.Label(label="Recognization Model Path:")
         model_path_box.pack_start(model_path_label, False, False, 0)
         self.model_path_entry = Gtk.Entry()
-        self.model_path_entry.set_text("vosk-model-small-en-us-0.15")
+        self.model_path_entry.set_text("vosk-model-en-us-0.42-gigaspeech")
         model_path_box.pack_start(self.model_path_entry, True, True, 0)
 
         # Output file
@@ -88,8 +88,8 @@ class AudioSubGenerator(Gtk.Window):
         generate_button.connect("clicked", self.generate_audio)
         vbox.pack_start(generate_button, False, False, 0)
 
-    def generate_audio_from_text(self, text, output_file, language, voice):
-        cmd = f"echo '{text}' | piper -c {language}-{voice}.onnx.json -m {language}-{voice}.onnx --output_file {output_file}"
+    def generate_audio_from_text(self, text, output_file, language, voice, length_scale=1.0):
+        cmd = f"echo '{text}' | piper -c {language}-{voice}.onnx.json -m {language}-{voice}.onnx --length-scale {length_scale} --output_file {output_file}"
         subprocess.run(cmd, shell=True)
 
     def transcribe_audio_to_srt(self, input_file, output_file, model_path, language):
@@ -115,32 +115,49 @@ class AudioSubGenerator(Gtk.Window):
 
         return text_file_path
 
-
     def generate_audio_from_srt(self, srt_file, output_file, language, voice, target_language):
         subs = pysrt.open(srt_file)
 
         audio_clips = []
-        for sub in subs:
+
+        for i, sub in enumerate(subs, start=1):
             text = sub.text.replace('\n', ' ')
-            start_time = sub.start.hours * 3600 + sub.start.minutes * 60 + sub.start.seconds
-            end_time = sub.end.hours * 3600 + sub.end.minutes * 60 + sub.end.seconds
-            duration = end_time - start_time
+            start_time_ms = (sub.start.hours * 3600 + sub.start.minutes * 60 + sub.start.seconds) * 1000
+            end_time_ms = (sub.end.hours * 3600 + sub.end.minutes * 60 + sub.end.seconds) * 1000
+            duration_ms = end_time_ms - start_time_ms
 
             translated_text = GoogleTranslator(source='auto', target=target_language).translate(text)
 
-            cmd = f"echo '{translated_text}' | piper -c {language}-{voice}.onnx.json -m {language}-{voice}.onnx --output_file /tmp/temp.wav"
-            subprocess.run(cmd, shell=True)
+            # Generate preliminary audio clip
+            temp_output_file = f"/tmp/temp_{i}.wav"
+            self.generate_audio_from_text(translated_text, temp_output_file, language, voice)
 
-            audio_clip = AudioSegment.from_wav("/tmp/temp.wav")
-            audio_clip = audio_clip._spawn(audio_clip.raw_data, overrides={
-                "frame_rate": audio_clip.frame_rate,
-                "channels": audio_clip.channels,
-                "sample_width": audio_clip.sample_width,
-                "duration": duration * 1000,  # Convert to milliseconds
-            })
-            audio_clips.append(audio_clip)
+            audio_clip = AudioSegment.from_wav(temp_output_file)
+            audio_clip_duration_ms = len(audio_clip)
 
-        final_audio = sum(audio_clips)
+            # Calculate length scale
+            length_scale = duration_ms / audio_clip_duration_ms
+
+            # Generate the final audio clip with the correct length scale
+            self.generate_audio_from_text(translated_text, temp_output_file, language, voice, length_scale)
+
+            adjusted_audio_clip = AudioSegment.from_wav(temp_output_file)
+            audio_clips.append((start_time_ms, adjusted_audio_clip))
+
+            # Remove temporary file
+            os.remove(temp_output_file)
+
+        # Combine audio clips with silence between them
+        final_audio = AudioSegment.empty()
+        prev_end_time_ms = 0
+
+        for start_time_ms, audio_clip in audio_clips:
+            if start_time_ms > prev_end_time_ms:
+                silence_duration_ms = start_time_ms - prev_end_time_ms
+                final_audio += AudioSegment.silent(duration=silence_duration_ms)
+            final_audio += audio_clip
+            prev_end_time_ms = start_time_ms + len(audio_clip)
+
         final_audio.export(output_file, format="wav")
 
     def choose_output_folder(self, widget):
@@ -187,13 +204,13 @@ class AudioSubGenerator(Gtk.Window):
             # Translate SRT file
             translated_srt_file = f"{base_name}_translated.srt"
             text_file_path = self.translate_srt_file(srt_file, translated_srt_file, target_language)
-        
+    
             # Do something with the text file path if needed
 
         else:
             dialog = Gtk.MessageDialog(
                 parent=self,
-                flags=Gtk.DialogFlags.MODAL,    
+                flags=Gtk.DialogFlags.MODAL,
                 type=Gtk.MessageType.ERROR,
                 buttons=Gtk.ButtonsType.OK,
                 message_format="Please fill in all fields.",
@@ -201,6 +218,8 @@ class AudioSubGenerator(Gtk.Window):
             dialog.run()
             dialog.destroy()
 
+    def get_silent_audio(self, duration_ms):
+        return AudioSegment.silent(duration=duration_ms)
 
     def replace_audio_in_video(self, input_video, new_audio, output_video):
         video = VideoFileClip(input_video)
